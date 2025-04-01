@@ -215,7 +215,7 @@ resource "aws_iam_role_policy_attachment" "eks_container_registry_read_only" {
   role       = aws_iam_role.eks_node_role.name
 }
 
-# Create IAM policy for Load Balancer Controller
+# Create IAM policy for Load Balancer Controller with fixed permissions
 resource "aws_iam_policy" "load_balancer_controller_policy" {
   name        = "AWSLoadBalancerControllerIAMPolicy"
   description = "IAM policy for AWS Load Balancer Controller"
@@ -378,13 +378,8 @@ resource "aws_iam_policy" "load_balancer_controller_policy" {
           "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*",
           "arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*",
           "arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*"
-        ],
-        "Condition" : {
-          "Null" : {
-            "aws:RequestTag/elbv2.k8s.aws/cluster" : "true",
-            "aws:ResourceTag/elbv2.k8s.aws/cluster" : "false"
-          }
-        }
+        ]
+        # Removed the Condition block that was causing the permission issue
       },
       {
         "Effect" : "Allow",
@@ -439,6 +434,35 @@ resource "aws_iam_policy" "load_balancer_controller_policy" {
       }
     ]
   })
+}
+
+# Create IAM role for AWS Load Balancer Controller
+resource "aws_iam_role" "aws_load_balancer_controller_role" {
+  name = "aws-load-balancer-controller-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer, "https://", "")}"
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${replace(aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# Attach the Load Balancer Controller policy to the role
+resource "aws_iam_role_policy_attachment" "aws_load_balancer_controller_attach" {
+  role       = aws_iam_role.aws_load_balancer_controller_role.name
+  policy_arn = aws_iam_policy.load_balancer_controller_policy.arn
 }
 
 resource "aws_iam_role_policy_attachment" "load_balancer_controller_policy_attachment" {
@@ -537,6 +561,9 @@ resource "aws_security_group" "eks_nodes_sg" {
   }
 }
 
+# Get current AWS account ID
+data "aws_caller_identity" "current" {}
+
 # Create an EKS cluster
 resource "aws_eks_cluster" "eks_cluster" {
   name     = "eks-cluster"
@@ -546,16 +573,28 @@ resource "aws_eks_cluster" "eks_cluster" {
   vpc_config {
     subnet_ids = [
       aws_subnet.public_subnet.id,
-      aws_subnet.private_subnet.id
+      aws_subnet.public_subnet_2.id,
+      aws_subnet.private_subnet.id,
+      aws_subnet.private_subnet_2.id
     ]
     security_group_ids      = [aws_security_group.eks_cluster_sg.id]
     endpoint_private_access = true
     endpoint_public_access  = true
   }
 
+  # Enable OIDC provider for service account IAM roles
+  enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
   depends_on = [
     aws_iam_role_policy_attachment.eks_cluster_policy
   ]
+}
+
+# Create OIDC provider for the EKS cluster
+resource "aws_iam_openid_connect_provider" "eks_oidc_provider" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da2b0ab7280"]
+  url             = aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer
 }
 
 # Create EKS node group
@@ -563,7 +602,7 @@ resource "aws_eks_node_group" "eks_node_group" {
   cluster_name    = aws_eks_cluster.eks_cluster.name
   node_group_name = "eks-node-group"
   node_role_arn   = aws_iam_role.eks_node_role.arn
-  subnet_ids      = [aws_subnet.private_subnet.id]
+  subnet_ids      = [aws_subnet.private_subnet.id, aws_subnet.private_subnet_2.id]
 
   scaling_config {
     desired_size = 2
@@ -584,6 +623,53 @@ resource "aws_eks_node_group" "eks_node_group" {
     aws_iam_role_policy_attachment.eks_cni_policy,
     aws_iam_role_policy_attachment.eks_container_registry_read_only,
     aws_iam_role_policy_attachment.load_balancer_controller_policy_attachment
+  ]
+}
+
+# Helm provider for installing AWS Load Balancer Controller
+provider "helm" {
+  kubernetes {
+    host                   = aws_eks_cluster.eks_cluster.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.eks_cluster.certificate_authority[0].data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks_cluster.name]
+      command     = "aws"
+    }
+  }
+}
+
+# Install AWS Load Balancer Controller using Helm
+resource "helm_release" "aws_load_balancer_controller" {
+  name       = "aws-load-balancer-controller"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  version    = "1.5.3"
+
+  set {
+    name  = "clusterName"
+    value = aws_eks_cluster.eks_cluster.name
+  }
+
+  set {
+    name  = "serviceAccount.create"
+    value = "true"
+  }
+
+  set {
+    name  = "serviceAccount.name"
+    value = "aws-load-balancer-controller"
+  }
+
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = aws_iam_role.aws_load_balancer_controller_role.arn
+  }
+
+  depends_on = [
+    aws_eks_node_group.eks_node_group,
+    aws_iam_role_policy_attachment.aws_load_balancer_controller_attach
   ]
 }
 
@@ -654,3 +740,4 @@ users:
         - "${var.aws_region}"
 KUBECONFIG
 }
+
